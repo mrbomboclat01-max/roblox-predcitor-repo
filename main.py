@@ -11,9 +11,9 @@ probability distribution over chart positions 1–10 for the next snapshot.
    baseline to distinguish real trends from one-off noise while keeping the
    window short enough that stale data doesn't swamp recent signal.
 
-2. RECENCY WEIGHTING
+2. RECENCY WEIGHTING (5× boost on last 3 snapshots)
    Within the 14-snapshot window, the three most recent snapshots are given
-   3× the weight of older ones. This applies to the weighted average rank and
+   5× the weight of older ones. This applies to the weighted average rank and
    to the slope calculation, so a game that surged in the last hour pulls its
    projected rank down faster than a slow historical climb would.
 
@@ -28,30 +28,31 @@ probability distribution over chart positions 1–10 for the next snapshot.
    The projected rank combines these:
        projected = weighted_avg_rank + 2.0 * slope - 2.0 * growth
 
-4. DROPOUT DETECTION
+4. DROPOUT DETECTION (+15 penalty)
    If a game appeared in the history window but is absent from the latest
-   snapshot, both its current_rank and projected_rank are penalised by +8
+   snapshot, both its current_rank and projected_rank are penalised by +15
    positions. This sharply reduces its weight in the top-10 probability
    distribution without zeroing it out entirely (the game may have been
    missed by a single scrape).
 
-5. TOP-POSITION STICKINESS
+5. TOP-POSITION STICKINESS (80% anchor at rank 1, 50% at rank 2)
    Games currently sitting at rank 1 or 2 have their projected rank pulled
    back toward their current position:
-     - Rank 1: 60% anchor toward current rank, 40% velocity
-     - Rank 2: 40% anchor toward current rank, 60% velocity
-   This reflects the empirical observation that #1 and #2 games churn less
-   than lower positions, and prevents a noisy velocity estimate from
-   displacing an incumbent unfairly.
+     - Rank 1: 80% anchor toward current rank, 20% velocity
+     - Rank 2: 50% anchor toward current rank, 50% velocity
+   This reflects the empirical observation that #1 games churn far less than
+   lower positions, and prevents a noisy velocity estimate from displacing an
+   incumbent unfairly. This directly mirrors the "sticky chart + #1-dropout
+   mixture" pattern observed in the top-scoring forecaster.
 
 6. GAUSSIAN PROBABILITY DISTRIBUTION
    For each chart position 1–10, a per-game weight is computed as:
        0.45 * exp(-|current_rank  - place| / 2.0)
-     + 0.55 * exp(-|projected_rank - place| / 3.0)
-   The wider σ values (2.0 and 3.0) deliberately spread probability mass to
-   neighbouring ranks, so a game projected near rank 4 also contributes
-   meaningfully to places 2–6. Weights are normalised to sum to 0.99 per
-   place (leaving 1% unallocated as a regularisation floor).
+     + 0.55 * exp(-|projected_rank - place| / 4.0)
+   The wider σ=4.0 on the projected term deliberately spreads probability
+   mass to neighbouring ranks, so a game projected near rank 4 also
+   contributes meaningfully to places 1–7. Weights are normalised to sum
+   to 0.99 per place (leaving 1% unallocated as a regularisation floor).
 
 7. SHORT-SNAPSHOT PADDING
    If the latest snapshot contains fewer than 10 games (partial scrape or
@@ -177,13 +178,13 @@ def forecast_order(history):
 def soft_rank_forecast(history):
     # --- constants -----------------------------------------------------------
     HISTORY_WINDOW      = 14    # snapshots to consider
-    RECENCY_BOOST_COUNT = 3     # how many trailing snapshots get the boost
-    RECENCY_BOOST       = 3.0   # weight multiplier for recent snapshots
+    RECENCY_BOOST_COUNT = 3     # trailing snapshots that get the boost
+    RECENCY_BOOST       = 5.0   # weight multiplier for recent snapshots (up from 3×)
     SLOPE_CAP           = 4.0   # max rank-change per step (±)
-    DROPOUT_PENALTY     = 8.0   # rank penalty for games missing from latest snapshot
-    STICKY_RANKS        = {1: 0.6, 2: 0.4}  # stickiness anchor by current rank
+    DROPOUT_PENALTY     = 15.0  # rank penalty for games missing from latest snapshot (up from 8)
+    STICKY_RANKS        = {1: 0.8, 2: 0.5}  # stickiness anchor: rank1=80%, rank2=50%
     SIGMA_CURRENT       = 2.0   # Gaussian spread for current-rank term
-    SIGMA_PROJECTED     = 3.0   # Gaussian spread for projected-rank term
+    SIGMA_PROJECTED     = 4.0   # Gaussian spread for projected-rank term (up from 3.0)
     WEIGHT_CURRENT      = 0.45  # blend weight for current-rank Gaussian
     WEIGHT_PROJECTED    = 0.55  # blend weight for projected-rank Gaussian
 
@@ -201,7 +202,7 @@ def soft_rank_forecast(history):
     ]
 
     # --- build a rank+projection estimate for every candidate game -----------
-    estimates = {}  # universe_id -> (current_rank, projected_rank)
+    estimates: dict[int, tuple[float, float]] = {}
 
     for universe_id in set().union(*snapshots):
         # Collect (snapshot_index, (rank, playing)) for each appearance
@@ -223,9 +224,9 @@ def soft_rank_forecast(history):
         weighted_avg_rank = sum(r * w for r, w in zip(ranks, weights)) / total_weight
 
         # Recency-weighted slope: late-half avg minus early-half avg
-        mid          = len(ranks) // 2
-        early_ranks  = ranks[:mid]   if mid else ranks[:1]
-        late_ranks   = ranks[mid:]   if mid else ranks
+        mid           = len(ranks) // 2
+        early_ranks   = ranks[:mid]   if mid else ranks[:1]
+        late_ranks    = ranks[mid:]   if mid else ranks
         early_weights = weights[:mid] if mid else weights[:1]
         late_weights  = weights[mid:] if mid else weights
         early_avg = sum(r * w for r, w in zip(early_ranks,  early_weights)) / sum(early_weights)
@@ -242,12 +243,12 @@ def soft_rank_forecast(history):
         current_rank   = latest.get(universe_id, (min(ranks) + 10, 0))[0]
         projected_rank = max(1.0, min(100.0, weighted_avg_rank + 2.0 * slope - 2.0 * growth))
 
-        # Dropout penalty: demote games absent from the latest snapshot
+        # Dropout penalty: aggressively demote games absent from the latest snapshot
         if universe_id not in latest_ids:
             current_rank   = min(100.0, current_rank   + DROPOUT_PENALTY)
             projected_rank = min(100.0, projected_rank + DROPOUT_PENALTY)
 
-        # Top-position stickiness: anchor rank-1/2 games against noisy velocity
+        # Top-position stickiness: strongly anchor rank-1 games, moderately anchor rank-2
         if current_rank in STICKY_RANKS:
             stickiness_weight = STICKY_RANKS[current_rank]
             projected_rank = (
@@ -258,7 +259,7 @@ def soft_rank_forecast(history):
         estimates[universe_id] = (current_rank, projected_rank)
 
     # --- build Gaussian probability distributions for places 1–10 -----------
-    probabilities = {}
+    probabilities: dict[int, dict[int, float]] = {}
     for place in range(1, 11):
         place_weights = {
             universe_id: (
@@ -313,7 +314,6 @@ def main() -> None:
         json.dumps(forecast, separators=(",", ":"), sort_keys=True) + "\n",
         encoding="utf-8",
     )
-
 
 
 if __name__ == "__main__":
